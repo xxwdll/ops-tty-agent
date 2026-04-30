@@ -1,0 +1,26 @@
+# Binary
+/ops-tty-agent
+*.exe
+
+# Upload directory
+uploads/
+uploaded_file
+
+# Test files
+test.txt
+text.txt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Go
+*.test
+*.out
+vendor/
