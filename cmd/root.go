@@ -12,17 +12,22 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 )
 
 var (
-	port        int
-	shell       string
-	autoConfirm string
-	target      string // 代理目标节点URL
-	token       string // 认证token
-	serverToken string // 实际使用的token（指定或随机生成）
+	port               int
+	shell              string
+	autoConfirm        string
+	target             string // 代理目标节点URL
+	token              string // 认证token
+	serverToken        string // 实际使用的token（指定或随机生成）
+	maxUploadSize      int64  // 最大上传文件大小（字节），默认500MB
+	proxyTimeout       int    // 代理超时时间（秒），默认30秒
+	blockCommands      string // 要拦截的危险命令列表，逗号分隔，为空则不拦截
+	enableBlockCheck   bool   // 是否启用危险命令检查
 )
 
 var rootCmd = &cobra.Command{
@@ -39,6 +44,10 @@ func init() {
 	rootCmd.Flags().StringVarP(&autoConfirm, "auto-confirm", "a", "no", "是否自动确认执行命令 (yes/no)")
 	rootCmd.Flags().StringVarP(&target, "target", "t", "", "代理目标节点URL (如 http://b-node:8080)")
 	rootCmd.Flags().StringVarP(&token, "token", "k", "", "认证token (不指定则随机生成)")
+	rootCmd.Flags().Int64VarP(&maxUploadSize, "max-upload-size", "m", 500*1024*1024, "最大上传文件大小（字节），默认500MB")
+	rootCmd.Flags().IntVarP(&proxyTimeout, "proxy-timeout", "", 30, "代理超时时间（秒），默认30秒")
+	rootCmd.Flags().BoolVarP(&enableBlockCheck, "enable-block-check", "", false, "启用危险命令检查")
+	rootCmd.Flags().StringVarP(&blockCommands, "block-commands", "b", "", "要拦截的危险命令列表（逗号分隔），需配合 --enable-block-check 使用")
 }
 
 func Execute() {
@@ -57,6 +66,41 @@ type CommandResponse struct {
 	Error  string `json:"error,omitempty"`
 }
 
+// blockedPatterns 存储要拦截的命令模式
+var blockedPatterns []string
+
+// parseBlockedCommands 解析拦截命令列表
+func parseBlockedCommands() {
+	if blockCommands == "" {
+		blockedPatterns = []string{}
+		return
+	}
+	blockedPatterns = strings.Split(blockCommands, ",")
+	for i := range blockedPatterns {
+		blockedPatterns[i] = strings.TrimSpace(blockedPatterns[i])
+	}
+}
+
+// isBlockedCommand 检查命令是否在拦截列表中
+func isBlockedCommand(cmd string) bool {
+	if !enableBlockCheck || len(blockedPatterns) == 0 {
+		return false
+	}
+	for _, pattern := range blockedPatterns {
+		if strings.Contains(cmd, pattern) {
+			return true
+		}
+	}
+	return false
+}
+
+// getProxyClient 获取带超时的HTTP客户端
+func getProxyClient(timeout int) *http.Client {
+	return &http.Client{
+		Timeout: time.Duration(timeout) * time.Second,
+	}
+}
+
 func startServer() {
 	// 初始化token
 	if token != "" {
@@ -66,6 +110,12 @@ func startServer() {
 	}
 	log.Printf("认证Token: %s", serverToken)
 	log.Printf("请求时需在Header中添加: X-Token: %s", serverToken)
+
+	// 解析拦截命令列表
+	parseBlockedCommands()
+	if enableBlockCheck && len(blockedPatterns) > 0 {
+		log.Printf("危险命令检查已启用，拦截以下命令: %v", blockedPatterns)
+	}
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cmd", handleCommand)
@@ -141,6 +191,13 @@ func handleCommand(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("远程请求cmd: %s", req.Cmd)
 
+	// 检查危险命令
+	if isBlockedCommand(req.Cmd) {
+		log.Printf("拒绝执行危险命令: %s", req.Cmd)
+		jsonEncode(w, CommandResponse{Output: "", Error: "拒绝执行危险命令"})
+		return
+	}
+
 	// 代理模式：转发到目标节点
 	if target != "" {
 		proxyCommand(w, r, req)
@@ -183,7 +240,8 @@ func proxyCommand(w http.ResponseWriter, r *http.Request, req CommandRequest) {
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("X-Token", r.Header.Get("X-Token"))
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	client := getProxyClient(proxyTimeout)
+	resp, err := client.Do(httpReq)
 	if err != nil {
 		log.Printf("代理转发失败: %v", err)
 		jsonEncode(w, CommandResponse{Output: "", Error: "代理转发失败: " + err.Error()})
@@ -277,6 +335,14 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 检查文件大小限制
+	contentLength := r.ContentLength
+	if contentLength > maxUploadSize {
+		log.Printf("文件大小超过限制: %d > %d", contentLength, maxUploadSize)
+		http.Error(w, fmt.Sprintf("文件大小超过限制（最大%dMB）", maxUploadSize/(1024*1024)), http.StatusRequestEntityTooLarge)
+		return
+	}
+
 	// 创建上传目录
 	if err := os.MkdirAll("uploads", 0755); err != nil {
 		log.Printf("创建上传目录失败: %v", err)
@@ -294,10 +360,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer dst.Close()
 
-	// 读取并写入文件内容
-	if _, err = io.Copy(dst, r.Body); err != nil {
+	// 使用进度跟踪写入，支持检测卡住
+	tracker := newProgressTracker(contentLength)
+	if _, err = writeWithProgress(dst, r.Body, tracker); err != nil {
 		log.Printf("写入文件失败: %v", err)
-		http.Error(w, "写入文件失败", http.StatusInternalServerError)
+		http.Error(w, "写入文件失败: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 
@@ -309,7 +376,69 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// proxyUpload 转发上传请求到目标节点
+// uploadProgressTracker 跟踪上传进度，用于区分正常慢速上传和真正卡住
+type uploadProgressTracker struct {
+	totalSize    int64
+	writtenSize  int64
+	lastWritten  int64
+	lastCheckTime time.Time
+	stuckTimeout  time.Duration // 超过这个时间没有新数据则认为卡住
+}
+
+func newProgressTracker(totalSize int64) *uploadProgressTracker {
+	return &uploadProgressTracker{
+		totalSize:     totalSize,
+		writtenSize:   0,
+		lastWritten:   0,
+		lastCheckTime: time.Now(),
+		stuckTimeout:  30 * time.Second,
+	}
+}
+
+// isStuck 检查上传是否卡住（超过stuckTimeout没有新数据写入）
+func (t *uploadProgressTracker) isStuck() bool {
+	if t.writtenSize == t.lastWritten {
+		return time.Since(t.lastCheckTime) > t.stuckTimeout
+	}
+	t.lastWritten = t.writtenSize
+	t.lastCheckTime = time.Now()
+	return false
+}
+
+// writeWithProgress 带进度跟踪的写入，支持检测卡住并中断
+func writeWithProgress(dst *os.File, src io.Reader, tracker *uploadProgressTracker) (int64, error) {
+	buffer := make([]byte, 32*1024) // 32KB buffer
+	totalWritten := int64(0)
+
+	for {
+		n, err := src.Read(buffer)
+		if n > 0 {
+			written, writeErr := dst.Write(buffer[:n])
+			if writeErr != nil {
+				return totalWritten, writeErr
+			}
+			totalWritten += int64(written)
+			tracker.writtenSize = totalWritten
+
+			// 每写入10MB打印进度
+			if totalWritten%(10*1024*1024) == 0 {
+				log.Printf("上传进度: %dMB / %dMB", totalWritten/(1024*1024), tracker.totalSize/(1024*1024))
+			}
+
+			// 检查是否卡住
+			if tracker.isStuck() {
+				return totalWritten, fmt.Errorf("上传卡住（超过30秒无新数据）")
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return totalWritten, nil
+			}
+			return totalWritten, err
+		}
+	}
+}
+
 func proxyUpload(w http.ResponseWriter, r *http.Request, filename string) {
 	targetURL := target + "/upload/" + filename
 
@@ -335,7 +464,8 @@ func proxyUpload(w http.ResponseWriter, r *http.Request, filename string) {
 	// 转发token
 	req.Header.Set("X-Token", r.Header.Get("X-Token"))
 
-	resp, err := http.DefaultClient.Do(req)
+	client := getProxyClient(proxyTimeout)
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("代理上传失败: %v", err)
 		http.Error(w, "代理上传失败: "+err.Error(), http.StatusInternalServerError)
@@ -422,7 +552,8 @@ func proxyDownload(w http.ResponseWriter, r *http.Request, filename string) {
 	// 转发token
 	req.Header.Set("X-Token", r.Header.Get("X-Token"))
 
-	resp, err := http.DefaultClient.Do(req)
+	client := getProxyClient(proxyTimeout)
+	resp, err := client.Do(req)
 	if err != nil {
 		log.Printf("代理下载失败: %v", err)
 		http.Error(w, "代理下载失败: "+err.Error(), http.StatusInternalServerError)

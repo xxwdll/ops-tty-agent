@@ -10,6 +10,8 @@
 
 命令行代理服务 - go-tty升级版，支持远程命令执行、文件上传/下载、多级跳转代理和Token认证。
 
+**本工具主要面向 AI 使用场景**，通过 Claude Code Skill 安装后，AI 能自动学习使用本工具进行远程服务器状态查看、日志排查、问题修复等运维操作。
+
 ## 功能特性
 
 - 支持通过HTTP POST请求执行命令
@@ -35,7 +37,7 @@ go build -o ops-tty-agent .
 npx skills add https://github.com/xxwdll/ops-tty-agent --skill ops-tty-agent
 ```
 
-安装后，Claude Code 会自动识别 `ops-tty-agent` 相关命令。
+安装后，Claude Code 会自动识别 `ops-tty-agent` 相关命令，AI 可通过此技能直接执行远程命令。
 
 ## 使用方法
 
@@ -58,6 +60,8 @@ npx skills add https://github.com/xxwdll/ops-tty-agent --skill ops-tty-agent
 | --auto-confirm | -a | 自动确认 (yes=不审计, no=需确认) - 仅本地模式有效 | no |
 | --target | -t | 代理目标节点URL - 启用后进入代理模式 | 空 |
 | --token | -k | 认证token - 不指定则随机生成 | 随机生成 |
+| --max-upload-size | -m | 最大上传文件大小（字节） | 500MB |
+| --proxy-timeout | - | 代理超时时间（秒） | 30秒 |
 
 ### Token认证
 
@@ -118,6 +122,19 @@ curl -X GET http://localhost:80/download/test.txt \
 - 上传的文件会保存在当前目录的 `uploads` 文件夹中
 - 代理模式下 `--shell` 和 `--auto-confirm` 参数无效
 
+### 危险命令检查（可选）
+
+默认不拦截任何命令，如需启用：
+
+```bash
+# 启用危险命令检查，并指定要拦截的命令
+./ops-tty-agent --enable-block-check --block-commands "rm -rf /,dd if=,forkbomb"
+```
+
+也可以放在环境变量或配置文件中管理。
+
+**注意**：该功能默认关闭，测试机/装机场景请勿开启。
+
 ---
 
 <a name="english"></a>
@@ -125,6 +142,8 @@ curl -X GET http://localhost:80/download/test.txt \
 ## English
 
 Command-line proxy service - an upgraded version of go-tty, supporting remote command execution, file upload/download, multi-hop proxy, and token authentication.
+
+**This tool is designed for AI use cases**. After installing via Claude Code Skill, AI can automatically learn to use this tool for remote server status checks, log investigation, problem fixing, and other DevOps operations.
 
 ## Features
 
@@ -233,3 +252,14 @@ Requests sent to Node A are automatically forwarded to Node B. All nodes in the 
 - Recommended to use in controlled environments with strong tokens
 - Uploaded files are saved in the `uploads` directory
 - In proxy mode, `--shell` and `--auto-confirm` are ignored
+
+### Dangerous Command Check (Optional)
+
+Disabled by default. To enable:
+
+```bash
+# Enable dangerous command check with specific commands to block
+./ops-tty-agent --enable-block-check --block-commands "rm -rf /,dd if=,forkbomb"
+```
+
+**Note**: This feature is disabled by default. Do NOT enable on test machines or during OS installation.
