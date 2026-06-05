@@ -12,22 +12,25 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
 )
 
 var (
-	port               int
-	shell              string
-	autoConfirm        string
-	target             string // 代理目标节点URL
-	token              string // 认证token
-	serverToken        string // 实际使用的token（指定或随机生成）
-	maxUploadSize      int64  // 最大上传文件大小（字节），默认500MB
-	proxyTimeout       int    // 代理超时时间（秒），默认30秒
-	blockCommands      string // 要拦截的危险命令列表，逗号分隔，为空则不拦截
-	enableBlockCheck   bool   // 是否启用危险命令检查
+	port             int
+	shell            string
+	autoConfirm      string
+	target           string // 代理目标节点URL
+	token            string // 认证token
+	serverToken      string // 实际使用的token（指定或随机生成）
+	maxUploadSize    int64  // 最大上传文件大小（字节），默认500MB
+	proxyTimeout     int    // 代理超时时间（秒），默认30秒
+	blockCommands    string // 要拦截的危险命令列表，逗号分隔，为空则不拦截
+	enableBlockCheck bool   // 是否启用危险命令检查
+	historyMutex     sync.RWMutex
+	historyFile      string // 历史记录文件（启动时生成，带时间戳）
 )
 
 var rootCmd = &cobra.Command{
@@ -64,6 +67,23 @@ type CommandRequest struct {
 type CommandResponse struct {
 	Output string `json:"output"`
 	Error  string `json:"error,omitempty"`
+}
+
+// ExecutionHistory 执行历史记录
+type ExecutionHistory struct {
+	Records []ExecutionRecord `json:"records"`
+	NextID  int               `json:"next_id"`
+}
+
+// ExecutionRecord 单条执行记录
+type ExecutionRecord struct {
+	ID        int       `json:"id"`
+	Timestamp time.Time `json:"timestamp"`
+	Cmd       string    `json:"cmd"`
+	Output    string    `json:"output"`
+	Error     string    `json:"error,omitempty"`
+	Success   bool      `json:"success"`
+	Duration  int64     `json:"duration_ms"`
 }
 
 // blockedPatterns 存储要拦截的命令模式
@@ -111,16 +131,28 @@ func startServer() {
 	log.Printf("认证Token: %s", serverToken)
 	log.Printf("请求时需在Header中添加: X-Token: %s", serverToken)
 
+	// 生成历史记录文件名（带时间戳）
+	startTime := time.Now()
+	historyFile = fmt.Sprintf("ops-history_%s.json", startTime.Format("2006-01-02_15-04-05"))
+	log.Printf("历史记录文件: %s", historyFile)
+
 	// 解析拦截命令列表
 	parseBlockedCommands()
 	if enableBlockCheck && len(blockedPatterns) > 0 {
 		log.Printf("危险命令检查已启用，拦截以下命令: %v", blockedPatterns)
 	}
 
+	// 初始化历史记录文件
+	initHistoryFile()
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/cmd", handleCommand)
 	mux.HandleFunc("/upload", handleUpload)
 	mux.HandleFunc("/download/", handleDownload)
+	mux.HandleFunc("/history", handleHistory)
+	mux.HandleFunc("/history/", handleHistoryDetail)
+	mux.HandleFunc("/history-files", handleHistoryFiles)
+	mux.HandleFunc("/history-file/", handleHistoryFile)
 
 	addr := fmt.Sprintf(":%d", port)
 	if target != "" {
@@ -136,10 +168,81 @@ func startServer() {
 	log.Printf("访问 http://<主机地址>%s/cmd 执行命令", addr)
 	log.Printf("访问 http://<主机地址>%s/upload 上传文件", addr)
 	log.Printf("访问 http://<主机地址>%s/download/文件名 下载文件", addr)
+	log.Printf("访问 http://<主机地址>%s/history 查看本次执行历史", addr)
+	log.Printf("访问 http://<主机地址>%s/history-files 查看所有历史文件", addr)
 
 	if err := http.ListenAndServe(addr, mux); err != nil {
 		log.Fatalf("服务启动失败: %v", err)
 	}
+}
+
+// initHistoryFile 初始化历史记录文件
+func initHistoryFile() {
+	// 确保目录存在
+	dir := filepath.Dir(historyFile)
+	if dir != "." && dir != "" {
+		os.MkdirAll(dir, 0755)
+	}
+
+	// 如果文件不存在，创建空文件
+	if _, err := os.Stat(historyFile); os.IsNotExist(err) {
+		history := ExecutionHistory{
+			Records: []ExecutionRecord{},
+			NextID:  1,
+		}
+		saveHistory(&history)
+	}
+}
+
+// loadHistory 加载历史记录
+func loadHistory() (*ExecutionHistory, error) {
+	data, err := os.ReadFile(historyFile)
+	if err != nil {
+		return nil, err
+	}
+
+	var history ExecutionHistory
+	if err := json.Unmarshal(data, &history); err != nil {
+		return nil, err
+	}
+	return &history, nil
+}
+
+// saveHistory 保存历史记录
+func saveHistory(history *ExecutionHistory) error {
+	data, err := json.MarshalIndent(history, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	// 原子写入
+	tmpFile := historyFile + ".tmp"
+	if err := os.WriteFile(tmpFile, data, 0644); err != nil {
+		return err
+	}
+	return os.Rename(tmpFile, historyFile)
+}
+
+// addRecord 添加执行记录（线程安全）
+func addRecord(record *ExecutionRecord) error {
+	historyMutex.Lock()
+	defer historyMutex.Unlock()
+
+	history, err := loadHistory()
+	if err != nil {
+		return err
+	}
+
+	record.ID = history.NextID
+	history.Records = append(history.Records, *record)
+	history.NextID++
+
+	// 保留最近 1000 条记录
+	if len(history.Records) > 1000 {
+		history.Records = history.Records[len(history.Records)-1000:]
+	}
+
+	return saveHistory(history)
 }
 
 // generateToken 生成随机token
@@ -214,14 +317,108 @@ func handleCommand(w http.ResponseWriter, r *http.Request) {
 		log.Println("cmd结果已成功返回!")
 	}
 
+	// 记录开始时间
+	startTime := time.Now()
+
 	output, err := executeCommand(req.Cmd)
+
+	// 记录执行历史
+	record := &ExecutionRecord{
+		Timestamp: startTime,
+		Cmd:       req.Cmd,
+		Output:    output,
+		Success:   err == nil,
+		Duration:  time.Since(startTime).Milliseconds(),
+	}
 	if err != nil {
+		record.Error = err.Error()
 		log.Printf("命令执行失败: %s, 错误: %v, 输出: %s", req.Cmd, err, output)
+	} else {
+		log.Printf("命令执行成功: %s, 输出: %s", req.Cmd, output)
+	}
+
+	// 保存历史记录
+	if saveErr := addRecord(record); saveErr != nil {
+		log.Printf("保存历史记录失败: %v", saveErr)
+	}
+
+	if err != nil {
 		jsonEncode(w, CommandResponse{Output: output, Error: err.Error()})
 		return
 	}
-	log.Printf("命令执行成功: %s, 输出: %s", req.Cmd, output)
 	jsonEncode(w, CommandResponse{Output: output})
+}
+
+// handleHistory 获取历史记录列表
+func handleHistory(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "仅支持 GET 方法", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 验证token
+	if !validateToken(r) {
+		unauthorized(w)
+		return
+	}
+
+	history, err := loadHistory()
+	if err != nil {
+		http.Error(w, "加载历史记录失败", http.StatusInternalServerError)
+		return
+	}
+
+	// 可选：限制返回数量
+	limit := 100
+	if len(history.Records) > limit {
+		history.Records = history.Records[len(history.Records)-limit:]
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(history.Records)
+}
+
+// handleHistoryDetail 获取单条历史记录详情
+func handleHistoryDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "仅支持 GET 方法", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 验证token
+	if !validateToken(r) {
+		unauthorized(w)
+		return
+	}
+
+	// 提取 ID
+	idStr := strings.TrimPrefix(r.URL.Path, "/history/")
+	if idStr == "" {
+		http.Error(w, "缺少 ID", http.StatusBadRequest)
+		return
+	}
+
+	var id int
+	if _, err := fmt.Sscanf(idStr, "%d", &id); err != nil {
+		http.Error(w, "无效的 ID", http.StatusBadRequest)
+		return
+	}
+
+	history, err := loadHistory()
+	if err != nil {
+		http.Error(w, "加载历史记录失败", http.StatusInternalServerError)
+		return
+	}
+
+	for _, record := range history.Records {
+		if record.ID == id {
+			w.Header().Set("Content-Type", "application/json")
+			json.NewEncoder(w).Encode(record)
+			return
+		}
+	}
+
+	http.Error(w, "记录不存在", http.StatusNotFound)
 }
 
 // proxyCommand 转发命令到目标节点
@@ -240,6 +437,7 @@ func proxyCommand(w http.ResponseWriter, r *http.Request, req CommandRequest) {
 	httpReq.Header.Set("Content-Type", "application/json")
 	httpReq.Header.Set("X-Token", r.Header.Get("X-Token"))
 
+	startTime := time.Now()
 	client := getProxyClient(proxyTimeout)
 	resp, err := client.Do(httpReq)
 	if err != nil {
@@ -257,6 +455,20 @@ func proxyCommand(w http.ResponseWriter, r *http.Request, req CommandRequest) {
 	}
 
 	log.Printf("代理转发成功: %s -> %s", req.Cmd, target)
+
+	// 记录执行历史
+	record := &ExecutionRecord{
+		Timestamp: startTime,
+		Cmd:       req.Cmd,
+		Output:    result.Output,
+		Error:     result.Error,
+		Success:   result.Error == "",
+		Duration:  time.Since(startTime).Milliseconds(),
+	}
+	if saveErr := addRecord(record); saveErr != nil {
+		log.Printf("保存历史记录失败: %v", saveErr)
+	}
+
 	jsonEncode(w, result)
 }
 
@@ -378,9 +590,9 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 
 // uploadProgressTracker 跟踪上传进度，用于区分正常慢速上传和真正卡住
 type uploadProgressTracker struct {
-	totalSize    int64
-	writtenSize  int64
-	lastWritten  int64
+	totalSize     int64
+	writtenSize   int64
+	lastWritten   int64
 	lastCheckTime time.Time
 	stuckTimeout  time.Duration // 超过这个时间没有新数据则认为卡住
 }
@@ -572,4 +784,103 @@ func proxyDownload(w http.ResponseWriter, r *http.Request, filename string) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	io.Copy(w, resp.Body)
 	log.Printf("代理下载成功: %s -> %s", filename, target)
+}
+
+// HistoryFileInfo 历史文件信息
+type HistoryFileInfo struct {
+	Filename  string `json:"filename"`
+	StartTime string `json:"start_time"`
+	Records   int    `json:"records"`
+}
+
+// handleHistoryFiles 列出所有历史文件
+func handleHistoryFiles(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "仅支持 GET 方法", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 验证token
+	if !validateToken(r) {
+		unauthorized(w)
+		return
+	}
+
+	// 查找所有历史文件
+	files, err := filepath.Glob("ops-history_*.json")
+	if err != nil {
+		http.Error(w, "查找历史文件失败", http.StatusInternalServerError)
+		return
+	}
+
+	// 按时间倒序排列（最新的在前）
+	for i, j := 0, len(files)-1; i < j; i, j = i+1, j-1 {
+		files[i], files[j] = files[j], files[i]
+	}
+
+	// 读取每个文件的基本信息
+	var result []HistoryFileInfo
+	for _, f := range files {
+		// 从文件名解析时间: ops-history_2026-05-29_22-21-12.json
+		name := filepath.Base(f)
+		timeStr := strings.TrimPrefix(name, "ops-history_")
+		timeStr = strings.TrimSuffix(timeStr, ".json")
+		timeStr = strings.Replace(timeStr, "_", " ", 1) // 第一个下划线替换为空格
+
+		// 读取文件获取记录数
+		data, err := os.ReadFile(f)
+		records := 0
+		if err == nil {
+			var history ExecutionHistory
+			if json.Unmarshal(data, &history) == nil {
+				records = len(history.Records)
+			}
+		}
+
+		result = append(result, HistoryFileInfo{
+			Filename:  name,
+			StartTime: timeStr,
+			Records:   records,
+		})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// handleHistoryFile 读取指定历史文件
+func handleHistoryFile(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "仅支持 GET 方法", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 验证token
+	if !validateToken(r) {
+		unauthorized(w)
+		return
+	}
+
+	// 获取文件名
+	filename := strings.TrimPrefix(r.URL.Path, "/history-file/")
+	if filename == "" {
+		http.Error(w, "缺少文件名", http.StatusBadRequest)
+		return
+	}
+
+	// 安全检查：只允许 ops-history_*.json 文件
+	if !strings.HasPrefix(filename, "ops-history_") || !strings.HasSuffix(filename, ".json") {
+		http.Error(w, "无效的文件名", http.StatusBadRequest)
+		return
+	}
+
+	// 读取文件
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		http.Error(w, "文件不存在", http.StatusNotFound)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(data)
 }

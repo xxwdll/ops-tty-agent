@@ -2,9 +2,16 @@
 /ops-tty-agent
 *.exe
 
+# Build outputs
+builds/
+
 # Upload directory
 uploads/
 uploaded_file
+
+# History files
+ops-history_*.json
+data/
 
 # Test files
 test.txt
