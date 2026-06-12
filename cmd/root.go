@@ -12,12 +12,10 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -1255,15 +1253,8 @@ func handleStat(w http.ResponseWriter, r *http.Request) {
 		Mode:      st.Mode().String(),
 	}
 
-	// 尝试获取 owner/group（Linux/macOS）
-	if sys, ok := st.Sys().(*syscall.Stat_t); ok {
-		if u, err := user.LookupId(fmt.Sprintf("%d", sys.Uid)); err == nil {
-			res.Owner = u.Username
-		}
-		if g, err := user.LookupGroupId(fmt.Sprintf("%d", sys.Gid)); err == nil {
-			res.Group = g.Name
-		}
-	}
+	// 尝试获取 owner/group（Unix 系统）
+	fillOwnerGroup(st, &res)
 
 	jsonEncode(w, res)
 }
