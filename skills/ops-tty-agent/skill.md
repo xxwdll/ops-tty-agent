@@ -1,7 +1,7 @@
 ---
 name: ops-tty-agent
 description: 命令行代理服务 - 在本地代理远程命令执行和文件上传/下载，支持多级跳转代理和Token认证。当用户提及"ops-tty"、"代理命令"、"远程执行cmd"、"上传文件"、"下载文件"、"跳转代理"、"执行历史"时使用此技能。
-version: 1.3.0
+version: 1.4.0
 ---
 
 # ops-tty-agent - 命令行代理服务
@@ -78,11 +78,6 @@ curl -H "X-Token: your-token" http://localhost:80/history-files
     "filename": "ops-history_2026-05-29_22-24-23.json",
     "start_time": "2026-05-29 22-24-23",
     "records": 5
-  },
-  {
-    "filename": "ops-history_2026-05-28_10-00-00.json",
-    "start_time": "2026-05-28 10-00-00",
-    "records": 3
   }
 ]
 ```
@@ -90,20 +85,6 @@ curl -H "X-Token: your-token" http://localhost:80/history-files
 ### 查看本次执行历史
 ```bash
 curl -H "X-Token: your-token" http://localhost:80/history
-```
-
-**响应：**
-```json
-[
-  {
-    "id": 1,
-    "timestamp": "2026-05-29T22:20:35.794882+08:00",
-    "cmd": "df -h",
-    "output": "Filesystem 100G...",
-    "success": true,
-    "duration_ms": 5
-  }
-]
 ```
 
 ### 查看指定历史文件
@@ -169,8 +150,100 @@ curl -X POST http://localhost:80/cmd \
 
 **响应：**
 ```json
-{"output":"Filesystem      Size  Used Avail Use% Mounted on\n..."}
+{
+  "stdout": "Filesystem      Size  Used Avail Use% Mounted on\n...",
+  "stderr": "",
+  "exit_code": 0,
+  "duration_ms": 150,
+  "truncated": false
+}
 ```
+
+**重要：判断执行结果的规则（Claude 必须遵守）**
+- `exit_code == 0` 表示命令执行成功（即使 stdout 为空）
+- `exit_code != 0` 表示命令执行失败，重点分析 `stderr` 和 `error`
+- `stderr != ""` 不等于失败，很多命令（如 `grep` 无匹配）会写 stderr 但 exit_code=0
+- `truncated == true` 表示输出被截断了（超过 16MB），信息不完整，应改用更精确的命令
+- `error != ""` 表示系统级错误（如 shell 不存在、超时），不是命令本身的错误
+
+### 读取文件尾部（推荐替代 `tail` 命令）
+
+**请求：**
+```bash
+curl -H "X-Token: your-token" "http://localhost:80/tail?path=/var/log/syslog&lines=100&max_bytes=1048576"
+```
+
+**响应：**
+```json
+{
+  "lines": ["May 29 10:00:01 host cron[1234]: ...", "May 29 10:00:02 host sshd[5678]: ..."],
+  "total_lines_returned": 100,
+  "file_size": 52428800,
+  "truncated": false
+}
+```
+
+**为什么用这个而不是 `bash -c "tail -n 100"`？**
+- 返回结构化数组，不需要解析换行符
+- 自动返回文件大小，帮助判断日志增长速度
+- 自动处理大文件 seek，性能更好
+
+### 查看文件信息（推荐替代 `ls -la`）
+
+**请求：**
+```bash
+curl -H "X-Token: your-token" "http://localhost:80/stat?path=/var/log/syslog"
+```
+
+**响应：**
+```json
+{
+  "path": "/var/log/syslog",
+  "type": "file",
+  "size_bytes": 52428800,
+  "size_human": "50.0 MB",
+  "mtime": "2026-05-29T10:00:00+08:00",
+  "mode": "-rw-r--r--",
+  "owner": "root",
+  "group": "adm"
+}
+```
+
+**为什么用这个而不是 `bash -c "ls -la"`？**
+- 返回结构化 JSON，不需要解析人类友好的文本
+- 跨平台一致（macOS 和 Linux 的 `ls` 输出格式不同）
+- 包含 owner/group 信息，方便权限排查
+
+### 查看磁盘使用（推荐替代 `df -h`）
+
+**请求：**
+```bash
+curl -H "X-Token: your-token" http://localhost:80/disk
+```
+
+**响应：**
+```json
+{
+  "filesystems": [
+    {
+      "filesystem": "/dev/sda1",
+      "mountpoint": "/",
+      "size_bytes": 107374182400,
+      "size_human": "100.0 GB",
+      "used_bytes": 53687091200,
+      "used_human": "50.0 GB",
+      "free_bytes": 53687091200,
+      "free_human": "50.0 GB",
+      "used_percent": "50%"
+    }
+  ]
+}
+```
+
+**为什么用这个而不是 `bash -c "df -h"`？**
+- 返回结构化数组，直接遍历分析
+- 包含字节数和人类可读两种格式
+- 跨平台一致（macOS 的 `df` 和 Linux 的 `df` 输出不同）
 
 ### 上传文件
 
@@ -215,7 +288,10 @@ curl -X GET http://localhost:80/download/test.txt \
 
 | 接口 | 方法 | 说明 |
 |------|------|------|
-| `/cmd` | POST | 执行命令 |
+| `/cmd` | POST | 执行命令（返回结构化 stdout/stderr/exit_code） |
+| `/tail` | GET | 读取文件尾部（替代 `tail -n`，返回行数组） |
+| `/stat` | GET | 查看文件信息（替代 `ls -la`，结构化返回） |
+| `/disk` | GET | 查看磁盘使用（替代 `df -h`，结构化返回） |
 | `/upload/:filename` | PUT/POST | 上传文件 |
 | `/download/:filename` | GET | 下载文件 |
 | `/history` | GET | 查看本次执行历史 |
@@ -246,10 +322,31 @@ curl -X GET http://localhost:80/download/test.txt \
 ./ops-tty-agent --enable-block-check --block-commands "rm -rf /,dd if=,forkbomb"
 ```
 
+## Claude 使用建议
+
+### 优先使用专用接口
+Claude 在排查问题时，**优先使用专用接口**（`/tail`、`/stat`、`/disk`），而不是 `bash -c`：
+
+| 场景 | 推荐接口 | 不推荐 |
+|------|----------|--------|
+| 看日志 | `/tail?path=/var/log/xxx` | `bash -c "tail -n 100 /var/log/xxx"` |
+| 看文件大小/权限 | `/stat?path=/xxx` | `bash -c "ls -la /xxx"` |
+| 看磁盘使用 | `/disk` | `bash -c "df -h"` |
+| 执行复杂命令 | `/cmd` | — |
+
+### 判断执行结果
+调用 `/cmd` 后，按以下顺序判断：
+1. `error != ""` → 系统错误（如超时），需要重试或检查环境
+2. `exit_code != 0` → 命令执行失败，重点分析 `stderr`
+3. `exit_code == 0` → 成功，分析 `stdout`
+4. `truncated == true` → 输出被截断，需要缩小查询范围
+
 ## 使用场景
 
 1. **远程运维** - 通过HTTP接口执行服务器命令
 2. **文件传输** - 上传/下载脚本或配置文件
-3. **批量操作** - 结合脚本批量执行命令
-4. **跳板机代理** - 通过可访问节点代理访问隔离网络
-5. **执行历史追踪** - Claude Code 可查看历史了解之前做了什么
+3. **跨机房文件传输** - 两个机房的服务器不互通，通过本机（A）做中转，把文件从 B 传到 C，不落地磁盘，支持大文件
+4. **批量操作** - 结合脚本批量执行命令
+5. **跳板机代理** - 通过可访问节点代理访问隔离网络
+6. **执行历史追踪** - Claude Code 可查看历史了解之前做了什么
+7. **AI 辅助排查** - Claude 通过结构化接口高效获取系统状态

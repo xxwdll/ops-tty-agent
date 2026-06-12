@@ -15,9 +15,14 @@
 ## 功能特性
 
 - 支持通过HTTP POST请求执行命令
+- **结构化返回**（stdout/stderr/exit_code/duration_ms/truncated），让 AI 能准确判断执行结果
 - 支持文件上传/下载功能
+- **跨节点文件传输**（A 做中转，B→C，不落地磁盘，支持大文件）
 - 支持多级跳转代理（A→B→C链式转发）
 - 支持Token认证（指定或随机生成）
+- **内置专用运维接口**：文件尾部读取、文件信息查看、磁盘使用查看
+- 命令执行超时控制（默认60秒，请求可覆盖）和输出上限保护（16MB）
+- 危险命令拦截（可选）
 - 可配置端口、shell类型和是否自动确认执行命令
 - 支持多架构编译（amd64、arm64）
 
@@ -61,7 +66,9 @@ npx skills add https://github.com/xxwdll/ops-tty-agent --skill ops-tty-agent
 | --target | -t | 代理目标节点URL - 启用后进入代理模式 | 空 |
 | --token | -k | 认证token - 不指定则随机生成 | 随机生成 |
 | --max-upload-size | -m | 最大上传文件大小（字节） | 500MB |
-| --proxy-timeout | - | 代理超时时间（秒） | 30秒 |
+| --proxy-timeout | | 代理超时时间（秒） | 30秒 |
+| --enable-block-check | | 启用危险命令检查 | false |
+| --block-commands | -b | 要拦截的危险命令列表（逗号分隔） | 空 |
 
 ### Token认证
 
@@ -85,6 +92,83 @@ curl -X POST http://localhost:80/cmd \
   -d '{"cmd":"df -h"}'
 ```
 
+**返回示例：**
+```json
+{
+  "stdout": "Filesystem      Size  Used Avail Use% Mounted on\n/dev/sda1       100G   50G   50G  50% /",
+  "stderr": "",
+  "exit_code": 0,
+  "duration_ms": 150,
+  "truncated": false
+}
+```
+
+**AI 判断规则：**
+- `exit_code == 0` → 成功（即使 stdout 为空）
+- `exit_code != 0` → 失败，重点分析 `stderr`
+- `truncated == true` → 输出被截断（超过 16MB），需缩小查询范围
+
+### 读取文件尾部（推荐替代 `tail`）
+
+```bash
+curl -H "X-Token: mytoken" "http://localhost:80/tail?path=/var/log/syslog&lines=100&max_bytes=1048576"
+```
+
+**返回示例：**
+```json
+{
+  "lines": ["May 29 10:00:01 host cron[1234]: ...", "May 29 10:00:02 host sshd[5678]: ..."],
+  "total_lines_returned": 100,
+  "file_size": 52428800,
+  "truncated": false
+}
+```
+
+### 查看文件信息（推荐替代 `ls -la`）
+
+```bash
+curl -H "X-Token: mytoken" "http://localhost:80/stat?path=/var/log/syslog"
+```
+
+**返回示例：**
+```json
+{
+  "path": "/var/log/syslog",
+  "type": "file",
+  "size_bytes": 52428800,
+  "size_human": "50.0 MB",
+  "mtime": "2026-05-29T10:00:00+08:00",
+  "mode": "-rw-r--r--",
+  "owner": "root",
+  "group": "adm"
+}
+```
+
+### 查看磁盘使用（推荐替代 `df -h`）
+
+```bash
+curl -H "X-Token: mytoken" http://localhost:80/disk
+```
+
+**返回示例：**
+```json
+{
+  "filesystems": [
+    {
+      "filesystem": "/dev/sda1",
+      "mountpoint": "/",
+      "size_bytes": 107374182400,
+      "size_human": "100.0 GB",
+      "used_bytes": 53687091200,
+      "used_human": "50.0 GB",
+      "free_bytes": 53687091200,
+      "free_human": "50.0 GB",
+      "used_percent": "50%"
+    }
+  ]
+}
+```
+
 ### 上传文件
 
 ```bash
@@ -100,6 +184,42 @@ curl -X GET http://localhost:80/download/test.txt \
   -H "X-Token: mytoken" \
   -o test.txt
 ```
+
+### 跨节点文件传输（B → C，A 做中转）
+
+适用场景：B 和 C 两个机房不互通，但 A（你的电脑）能同时直连 B 和 C。
+
+**启动方式（三台都用本地模式）：**
+```bash
+# A（你的电脑）
+./ops-tty-agent --port 80 --shell bash --auto-confirm yes --token mytoken
+
+# B（源节点）
+./ops-tty-agent --port 8080 --shell bash --auto-confirm yes --token mytoken
+
+# C（目标节点）
+./ops-tty-agent --port 8080 --shell bash --auto-confirm yes --token mytoken
+```
+
+**请求：**
+```bash
+curl -X POST http://localhost:80/transfer \
+  -H "Content-Type: application/json" \
+  -H "X-Token: mytoken" \
+  -d '{
+    "source_url": "http://B:8080/download/data.tar.gz",
+    "target_url": "http://C:8080/upload/data.tar.gz"
+  }'
+```
+
+**响应：**
+```json
+{"success": true, "bytes": 104857600, "duration_ms": 15234}
+```
+
+**特点：**
+- 不落地磁盘，流式传输，支持大文件
+- 默认复用当前服务 Token，B/C Token 不同时可指定 `source_token`/`target_token`
 
 ### 代理模式
 
