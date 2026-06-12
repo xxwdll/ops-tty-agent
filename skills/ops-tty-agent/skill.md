@@ -1,201 +1,129 @@
 ---
 name: ops-tty-agent
-description: 命令行代理服务 - 在本地代理远程命令执行和文件上传/下载，支持多级跳转代理和Token认证。当用户提及"ops-tty"、"代理命令"、"远程执行cmd"、"上传文件"、"下载文件"、"跳转代理"、"执行历史"时使用此技能。
-version: 1.4.0
+description: 远程命令执行和文件操作代理。当用户需要查看远程服务器日志、执行命令、上传下载文件、排查问题、或在多个不互通的节点间传输文件时使用此技能。
+version: 1.5.0
 ---
 
-# ops-tty-agent - 命令行代理服务
+# ops-tty-agent - AI 调用指南
 
-ops-tty-agent 是 go-tty 项目的升级版，用于在本地代理命令行执行，支持远程命令执行、文件上传/下载、多级跳转代理和执行历史记录。
+**这是给 AI 看的文档**。告诉 AI 什么时候调什么接口、参数怎么传、返回怎么判断。
 
-## 项目位置
+**SOP（怎么启动服务）见文档底部**，那是给客户看的。
 
-项目位于: `/Users/user/Desktop/Code/ops-tty-agent/`
+---
 
-## 快速开始
+## 一、决策流程：先判断场景，再选接口
 
-### 编译项目
-```bash
-cd /Users/user/Desktop/Code/ops-tty-agent
-go build -o ops-tty-agent
-```
+### 场景 1：查看日志文件
+**不要** `bash -c "tail -n 100 /var/log/xxx"` ❌
+**要** `GET /tail?path=/var/log/xxx&lines=100` ✅
 
-### 启动服务
-```bash
-# 本地模式（执行本地命令）
-./ops-tty-agent --port 80 --shell bash --auto-confirm no
+理由：返回结构化行数组，自动返回文件大小，不需要解析文本。
 
-# 代理模式（纯转发，不执行本地命令）
-./ops-tty-agent --port 80 --target http://b-node:8080
-```
+### 场景 2：查看文件/目录信息
+**不要** `bash -c "ls -la /xxx"` ❌
+**要** `GET /stat?path=/xxx` ✅
 
-#### 启动参数
-| 参数 | 简写 | 说明 | 默认值 |
-|------|------|------|--------|
-| --port | -p | 服务端口 | 8080 |
-| --shell | -s | shell类型 (bash/zsh/sh) - 仅本地模式有效 | bash |
-| --auto-confirm | -a | 自动确认 (yes=不审计, no=需确认) - 仅本地模式有效 | no |
-| --target | -t | 代理目标节点URL - 启用后进入代理模式 | 空 |
-| --token | -k | 认证token - 不指定则随机生成 | 随机生成 |
-| --max-upload-size | -m | 最大上传文件大小（字节） | 500MB |
-| --proxy-timeout | | 代理超时时间（秒） | 30秒 |
-| --enable-block-check | | 启用危险命令检查 | false |
-| --block-commands | -b | 要拦截的危险命令列表（逗号分隔） | 空 |
+理由：返回结构化 JSON（大小、权限、owner、修改时间），跨平台一致。
 
-#### 模式说明
-- **本地模式**：不指定 `--target`，在本地执行命令，支持 `--shell` 和 `--auto-confirm`
-- **代理模式**：指定 `--target`，纯转发请求到目标节点，忽略 `--shell` 和 `--auto-confirm`
+### 场景 3：查看磁盘使用
+**不要** `bash -c "df -h"` ❌
+**要** `GET /disk` ✅
 
-#### Token 认证
-所有请求必须在 Header 中携带 `X-Token`：
-```bash
-curl -H "X-Token: your-token" http://localhost:80/cmd ...
-```
+理由：返回结构化数组，含字节数和人类可读两种格式，不需要解析 `df` 的文本输出。
 
-- 指定 `--token`：使用固定 token
-- 不指定：启动时随机生成 32 位 token，日志中显示
+### 场景 4：执行复杂命令（grep、awk、sed、管道等）
+**用** `POST /cmd` ✅
 
-## 执行历史记录
+### 场景 5：从 B 节点传文件到 C 节点（B 和 C 不互通）
+**用** `POST /transfer` ✅
 
-每次启动会生成一个带时间戳的历史文件，记录所有执行的命令和输出。Claude Code 可以通过这些历史了解之前做了什么。
+A（本机）做中转，不落盘，流式传输。
 
-### 历史文件命名规则
-```
-ops-history_YYYY-MM-DD_HH-MM-SS.json
-```
+### 场景 6：上传/下载文件
+**用** `PUT /upload/:filename` / `GET /download/:filename` ✅
 
-例如：`ops-history_2026-05-29_22-24-23.json`
+---
 
-### 查看所有历史文件
-```bash
-curl -H "X-Token: your-token" http://localhost:80/history-files
-```
+## 二、接口详情
 
-**响应：**
-```json
-[
-  {
-    "filename": "ops-history_2026-05-29_22-24-23.json",
-    "start_time": "2026-05-29 22-24-23",
-    "records": 5
-  }
-]
-```
+所有请求 Header 必须携带：`X-Token: <token>`
 
-### 查看本次执行历史
-```bash
-curl -H "X-Token: your-token" http://localhost:80/history
-```
+### POST /cmd — 执行命令
 
-### 查看指定历史文件
-```bash
-curl -H "X-Token: your-token" http://localhost:80/history-file/ops-history_2026-05-28_10-00-00.json
-```
+**什么时候用**：专用接口覆盖不了的复杂操作（grep、awk、管道、安装软件等）
 
-### 使用场景
-机器开机后，Claude Code 可以：
-1. 调用 `/history-files` 查看所有历史文件
-2. 通过文件名知道每次启动的时间
-3. 调用 `/history-file/xxx` 读取特定历史，了解之前做了什么
-
-## 代理模式
-
-### 多级跳转
-当你只能访问A节点，但需要操作B节点时，可以通过A节点代理：
-
-```
-你 → A节点(ops-tty-agent) → B节点(ops-tty-agent) → 执行命令
-```
-
-**A节点启动（代理模式）：**
-```bash
-./ops-tty-agent --port 80 --target http://b-node:8080 --token mytoken
-```
-
-**B节点启动（本地模式）：**
-```bash
-./ops-tty-agent --port 8080 --shell bash --token mytoken
-```
-
-**注意：代理模式下，A节点会自动转发请求中的 Token 到 B节点，确保两端 Token 一致。**
-
-### 多级链式代理
-支持 A→B→C 多级跳转：
-```bash
-# A节点
-./ops-tty-agent --port 80 --target http://b-node:8080 --token chain-token
-
-# B节点
-./ops-tty-agent --port 8080 --target http://c-node:8080 --token chain-token
-
-# C节点
-./ops-tty-agent --port 8080 --shell bash --token chain-token
-```
-
-**所有节点使用相同 Token，请求自动沿链路转发。**
-
-## API 使用
-
-**注意：所有请求必须在 Header 中携带 `X-Token`**
-
-### 执行命令
-
-**请求：**
-```bash
-curl -X POST http://localhost:80/cmd \
-  -H "Content-Type: application/json" \
-  -H "X-Token: your-token" \
-  -d '{"cmd":"df -h"}'
-```
-
-**响应：**
+**请求体**：
 ```json
 {
-  "stdout": "Filesystem      Size  Used Avail Use% Mounted on\n...",
+  "cmd": "df -h",
+  "timeout_seconds": 60
+}
+```
+- `cmd`：要执行的命令字符串（必填）
+- `timeout_seconds`：超时秒数（可选，默认 60s）。长命令如 `yum install` 可设 300
+
+**返回**：
+```json
+{
+  "stdout": "...",
   "stderr": "",
   "exit_code": 0,
   "duration_ms": 150,
-  "truncated": false
+  "truncated": false,
+  "error": ""
 }
 ```
 
-**重要：判断执行结果的规则（Claude 必须遵守）**
-- `exit_code == 0` 表示命令执行成功（即使 stdout 为空）
-- `exit_code != 0` 表示命令执行失败，重点分析 `stderr` 和 `error`
-- `stderr != ""` 不等于失败，很多命令（如 `grep` 无匹配）会写 stderr 但 exit_code=0
-- `truncated == true` 表示输出被截断了（超过 16MB），信息不完整，应改用更精确的命令
-- `error != ""` 表示系统级错误（如 shell 不存在、超时），不是命令本身的错误
+**判断规则（按优先级）**：
+1. `error != ""` → 系统错误（超时、shell 不存在等），重试或检查环境
+2. `exit_code != 0` → 命令执行失败，重点分析 `stderr`
+3. `exit_code == 0` → 成功，分析 `stdout`
+4. `truncated == true` → 输出超过 16MB 被截断，信息不完整，应缩小查询范围
+5. `stderr != ""` 但 `exit_code == 0` → 不是失败，只是命令写了 stderr（如 `grep` 无匹配）
 
-### 读取文件尾部（推荐替代 `tail` 命令）
+---
 
-**请求：**
-```bash
-curl -H "X-Token: your-token" "http://localhost:80/tail?path=/var/log/syslog&lines=100&max_bytes=1048576"
+### GET /tail — 读取文件尾部
+
+**什么时候用**：看日志文件
+
+**URL 参数**：
+- `path`：文件绝对路径（必填）
+- `lines`：返回行数（可选，默认 100）
+- `max_bytes`：最多读取的字节数（可选，默认 1MB）
+
+**示例**：
+```
+GET /tail?path=/var/log/syslog&lines=200&max_bytes=2097152
 ```
 
-**响应：**
+**返回**：
 ```json
 {
-  "lines": ["May 29 10:00:01 host cron[1234]: ...", "May 29 10:00:02 host sshd[5678]: ..."],
-  "total_lines_returned": 100,
+  "lines": ["line1", "line2", "..."],
+  "total_lines_returned": 200,
   "file_size": 52428800,
-  "truncated": false
+  "truncated": false,
+  "error": ""
 }
 ```
 
-**为什么用这个而不是 `bash -c "tail -n 100"`？**
-- 返回结构化数组，不需要解析换行符
-- 自动返回文件大小，帮助判断日志增长速度
-- 自动处理大文件 seek，性能更好
+---
 
-### 查看文件信息（推荐替代 `ls -la`）
+### GET /stat — 查看文件/目录信息
 
-**请求：**
-```bash
-curl -H "X-Token: your-token" "http://localhost:80/stat?path=/var/log/syslog"
+**什么时候用**：检查文件大小、权限、owner、修改时间
+
+**URL 参数**：
+- `path`：文件/目录绝对路径（必填）
+
+**示例**：
+```
+GET /stat?path=/var/log/syslog
 ```
 
-**响应：**
+**返回**：
 ```json
 {
   "path": "/var/log/syslog",
@@ -205,23 +133,23 @@ curl -H "X-Token: your-token" "http://localhost:80/stat?path=/var/log/syslog"
   "mtime": "2026-05-29T10:00:00+08:00",
   "mode": "-rw-r--r--",
   "owner": "root",
-  "group": "adm"
+  "group": "adm",
+  "error": ""
 }
 ```
 
-**为什么用这个而不是 `bash -c "ls -la"`？**
-- 返回结构化 JSON，不需要解析人类友好的文本
-- 跨平台一致（macOS 和 Linux 的 `ls` 输出格式不同）
-- 包含 owner/group 信息，方便权限排查
+---
 
-### 查看磁盘使用（推荐替代 `df -h`）
+### GET /disk — 查看磁盘使用
 
-**请求：**
-```bash
-curl -H "X-Token: your-token" http://localhost:80/disk
+**什么时候用**：排查磁盘空间问题
+
+**示例**：
+```
+GET /disk
 ```
 
-**响应：**
+**返回**：
 ```json
 {
   "filesystems": [
@@ -236,117 +164,180 @@ curl -H "X-Token: your-token" http://localhost:80/disk
       "free_human": "50.0 GB",
       "used_percent": "50%"
     }
-  ]
+  ],
+  "error": ""
 }
 ```
 
-**为什么用这个而不是 `bash -c "df -h"`？**
-- 返回结构化数组，直接遍历分析
-- 包含字节数和人类可读两种格式
-- 跨平台一致（macOS 的 `df` 和 Linux 的 `df` 输出不同）
+---
 
-### 上传文件
+### PUT /upload/:filename — 上传文件
 
-**方法1：URL路径指定文件名**
+**什么时候用**：向远程节点上传脚本、配置文件等
+
+**示例**：
 ```bash
-curl -X PUT http://localhost:80/upload/test.txt \
-  -H "X-Token: your-token" \
-  --data-binary @test.txt
+PUT /upload/test.txt
+Header: X-Token: xxx
+Body: <文件二进制内容>
 ```
 
-**方法2：Content-Disposition指定文件名**
-```bash
-curl -X POST http://localhost:80/upload \
-  -H "Content-Disposition: attachment; filename=\"test.txt\"" \
-  -H "X-Token: your-token" \
-  --data-binary @test.txt
-```
-
-**响应：**
+**返回**：
 ```json
 {"message":"文件上传成功","path":"uploads/test.txt"}
 ```
 
-文件保存位置：`uploads/` 目录（代理模式下保存到最终目标节点）
+---
 
-### 下载文件
+### GET /download/:filename — 下载文件
 
-**请求：**
+**什么时候用**：从远程节点下载文件
+
+**示例**：
 ```bash
-curl -X GET http://localhost:80/download/test.txt \
-  -H "X-Token: your-token" \
-  -o test.txt
+GET /download/test.txt
+Header: X-Token: xxx
 ```
 
-**响应：**
-- 成功：返回文件内容，状态码 200
-- 文件不存在：`{"error":"文件不存在"}`，状态码 404
+**返回**：文件二进制内容（200）或 404
 
-文件下载位置：`uploads/` 目录（代理模式下从最终目标节点获取）
+---
 
-## API 汇总
+### POST /transfer — 跨节点文件传输
 
-| 接口 | 方法 | 说明 |
-|------|------|------|
-| `/cmd` | POST | 执行命令（返回结构化 stdout/stderr/exit_code） |
-| `/tail` | GET | 读取文件尾部（替代 `tail -n`，返回行数组） |
-| `/stat` | GET | 查看文件信息（替代 `ls -la`，结构化返回） |
-| `/disk` | GET | 查看磁盘使用（替代 `df -h`，结构化返回） |
-| `/upload/:filename` | PUT/POST | 上传文件 |
-| `/download/:filename` | GET | 下载文件 |
-| `/history` | GET | 查看本次执行历史 |
-| `/history/:id` | GET | 查看单条历史详情 |
-| `/history-files` | GET | 列出所有历史文件 |
-| `/history-file/:filename` | GET | 读取指定历史文件 |
+**什么时候用**：B 和 C 两个机房不互通，但 A（本机）能同时直连 B 和 C，需要把文件从 B 传到 C
 
-## 安全说明
+**请求体**：
+```json
+{
+  "source_url": "http://B:8080/download/data.tar.gz",
+  "source_token": "token-b",
+  "target_url": "http://C:8080/upload/data.tar.gz",
+  "target_token": "token-c"
+}
+```
+- `source_url` / `target_url`：完整 URL（必填）
+- `source_token` / `target_token`：可选，不填则用当前服务 Token
 
-### 自动确认模式
-- `--auto-confirm no` (推荐)：每次执行命令都需要本地确认
-  ```
-  远程请求cmd: df -h
-  是否同意执行 y/n: y
-  cmd结果已成功返回!
-  ```
-
-- `--auto-confirm yes`：直接执行，无确认提示
-
-### 支持的 Shell
-- bash (默认)
-- zsh
-- sh
-
-### 危险命令检查（可选）
-```bash
-# 启用危险命令检查
-./ops-tty-agent --enable-block-check --block-commands "rm -rf /,dd if=,forkbomb"
+**返回**：
+```json
+{
+  "success": true,
+  "bytes": 104857600,
+  "duration_ms": 15234,
+  "error": ""
+}
 ```
 
-## Claude 使用建议
+**注意**：
+- 必须在 A（本机）直接调用，不能通过代理链转发
+- 不落盘，流式传输，支持大文件
 
-### 优先使用专用接口
-Claude 在排查问题时，**优先使用专用接口**（`/tail`、`/stat`、`/disk`），而不是 `bash -c`：
+---
 
-| 场景 | 推荐接口 | 不推荐 |
-|------|----------|--------|
-| 看日志 | `/tail?path=/var/log/xxx` | `bash -c "tail -n 100 /var/log/xxx"` |
-| 看文件大小/权限 | `/stat?path=/xxx` | `bash -c "ls -la /xxx"` |
-| 看磁盘使用 | `/disk` | `bash -c "df -h"` |
-| 执行复杂命令 | `/cmd` | — |
+### GET /history — 查看本次执行历史
 
-### 判断执行结果
-调用 `/cmd` 后，按以下顺序判断：
-1. `error != ""` → 系统错误（如超时），需要重试或检查环境
-2. `exit_code != 0` → 命令执行失败，重点分析 `stderr`
-3. `exit_code == 0` → 成功，分析 `stdout`
-4. `truncated == true` → 输出被截断，需要缩小查询范围
+**什么时候用**：想了解这个 agent 之前执行过什么命令
 
-## 使用场景
+**示例**：
+```
+GET /history
+```
 
-1. **远程运维** - 通过HTTP接口执行服务器命令
-2. **文件传输** - 上传/下载脚本或配置文件
-3. **跨机房文件传输** - 两个机房的服务器不互通，通过本机（A）做中转，把文件从 B 传到 C，不落地磁盘，支持大文件
-4. **批量操作** - 结合脚本批量执行命令
-5. **跳板机代理** - 通过可访问节点代理访问隔离网络
-6. **执行历史追踪** - Claude Code 可查看历史了解之前做了什么
-7. **AI 辅助排查** - Claude 通过结构化接口高效获取系统状态
+**返回**：执行记录数组（含 cmd、stdout、success、duration_ms）
+
+---
+
+## 三、快速查表
+
+| 你想做什么 | 调哪个接口 | 参数 |
+|-----------|-----------|------|
+| 看日志 | `GET /tail?path=...&lines=...` | path, lines, max_bytes |
+| 看文件信息 | `GET /stat?path=...` | path |
+| 看磁盘 | `GET /disk` | 无 |
+| 执行命令 | `POST /cmd` | cmd, timeout_seconds |
+| 上传文件 | `PUT /upload/:filename` | 文件内容 |
+| 下载文件 | `GET /download/:filename` | 无 |
+| B→C 传文件 | `POST /transfer` | source_url, target_url |
+| 看执行历史 | `GET /history` | 无 |
+
+---
+
+## 四、SOP（标准操作流程）—— 给客户看的
+
+### 启动服务
+
+```bash
+# 本地模式（执行本地命令）
+./ops-tty-agent --port 80 --shell bash --auto-confirm yes --token mytoken
+
+# 代理模式（转发到目标节点）
+./ops-tty-agent --port 80 --target http://b-node:8080 --token mytoken
+```
+
+### 命令行参数
+
+| 参数 | 简写 | 说明 | 默认值 |
+|------|------|------|--------|
+| --port | -p | 服务端口 | 8080 |
+| --shell | -s | shell类型 (bash/zsh/sh) | bash |
+| --auto-confirm | -a | 自动确认 (yes/no) | no |
+| --target | -t | 代理目标节点URL | 空 |
+| --token | -k | 认证token | 随机生成 |
+| --max-upload-size | -m | 最大上传文件大小 | 500MB |
+| --proxy-timeout | | 代理超时时间（秒） | 30秒 |
+| --enable-block-check | | 启用危险命令检查 | false |
+| --block-commands | -b | 拦截命令列表（逗号分隔） | 空 |
+
+### 代理模式（A→B 跳转）
+
+```bash
+# A节点（代理模式）
+./ops-tty-agent --port 80 --target http://b-node:8080 --token mytoken
+
+# B节点（本地模式）
+./ops-tty-agent --port 8080 --shell bash --token mytoken
+```
+
+### 跨节点传输（B→C，A 做中转）
+
+```bash
+# A（本机）
+./ops-tty-agent --port 80 --shell bash --auto-confirm yes --token mytoken
+
+# B（源节点）
+./ops-tty-agent --port 8080 --shell bash --auto-confirm yes --token mytoken
+
+# C（目标节点）
+./ops-tty-agent --port 8080 --shell bash --auto-confirm yes --token mytoken
+```
+
+然后调用 A 的 `/transfer`：
+```bash
+curl -X POST http://A:80/transfer \
+  -H "X-Token: mytoken" \
+  -d '{"source_url":"http://B:8080/download/file.tar.gz","target_url":"http://C:8080/upload/file.tar.gz"}'
+```
+
+### 安全说明
+
+- `--auto-confirm yes`：适合 AI 自动化场景，无需人工确认
+- `--auto-confirm no`：每次命令需终端输入 y/n，更安全
+- 危险命令检查（可选）：`--enable-block-check --block-commands "rm -rf /,dd if="`
+
+---
+
+## 五、项目位置
+
+本地项目：`/Users/user/Desktop/Code/ai/ops-tty-agent/`
+
+编译：
+```bash
+cd /Users/user/Desktop/Code/ai/ops-tty-agent
+go build -o ops-tty-agent
+```
+
+多架构编译：
+```bash
+./build.sh
+```
