@@ -249,7 +249,7 @@ func startServer() {
 	mux.HandleFunc("/stat", handleStat)
 	mux.HandleFunc("/disk", handleDisk)
 	mux.HandleFunc("/transfer", handleTransfer)
-	mux.HandleFunc("/upload", handleUpload)
+	mux.HandleFunc("/upload/", handleUpload)
 	mux.HandleFunc("/download/", handleDownload)
 	mux.HandleFunc("/history", handleHistory)
 	mux.HandleFunc("/history/", handleHistoryDetail)
@@ -683,25 +683,30 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 读取目标目录参数（可选，默认 uploads/）
-	targetDir := r.URL.Query().Get("dir")
-	if targetDir == "" {
-		targetDir = "uploads"
+	// 安全检查文件名：清理路径并防止目录穿越
+	filename = filepath.Clean(filename)
+	if strings.Contains(filename, "..") || filepath.IsAbs(filename) {
+		http.Error(w, "文件名包含非法路径", http.StatusBadRequest)
+		return
 	}
-	// 安全检查
-	if filepath.IsAbs(targetDir) {
-		if strings.Contains(targetDir, "..") {
-			http.Error(w, "路径不能包含 ..", http.StatusBadRequest)
-			return
-		}
-	} else {
-		targetDir = "uploads"
-	}
+
+	// 读取目标目录参数
+	rawDir := r.URL.Query().Get("dir")
 
 	// 代理模式：转发到目标节点（带上 ?dir= 参数）
 	if target != "" {
-		queryDir := r.URL.Query().Get("dir")
-		proxyUpload(w, r, filename, queryDir)
+		proxyUpload(w, r, filename, rawDir)
+		return
+	}
+
+	// 本地模式：解析并清理目标目录（默认当前工作目录）
+	targetDir := rawDir
+	if targetDir == "" {
+		targetDir = "."
+	}
+	targetDir = filepath.Clean(targetDir)
+	if strings.Contains(targetDir, "..") {
+		http.Error(w, "路径不能包含 ..", http.StatusBadRequest)
 		return
 	}
 
@@ -713,11 +718,13 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 创建上传目录
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		log.Printf("创建上传目录失败: %v", err)
-		http.Error(w, "创建上传目录失败", http.StatusInternalServerError)
-		return
+	// 创建上传目录（当前目录则跳过）
+	if targetDir != "." {
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			log.Printf("创建上传目录失败: %v", err)
+			http.Error(w, "创建上传目录失败", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	// 保存文件
