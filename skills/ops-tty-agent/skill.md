@@ -177,14 +177,23 @@ GET /disk
 
 **示例**：
 ```bash
+# 上传到默认 uploads/ 目录
 PUT /upload/test.txt
+Header: X-Token: xxx
+Body: <文件二进制内容>
+
+# 上传到指定目录
+PUT /upload/nginx.conf?dir=/etc/nginx/
 Header: X-Token: xxx
 Body: <文件二进制内容>
 ```
 
+**参数**：
+- `dir`：目标目录（可选，默认 `uploads/`，必须为绝对路径且不含 `..`）
+
 **返回**：
 ```json
-{"message":"文件上传成功","path":"uploads/test.txt"}
+{"message":"文件上传成功","path":"/etc/nginx/nginx.conf"}
 ```
 
 ---
@@ -195,9 +204,17 @@ Body: <文件二进制内容>
 
 **示例**：
 ```bash
+# 从 uploads/ 下载
 GET /download/test.txt
 Header: X-Token: xxx
+
+# 从任意路径下载
+GET /download/nginx.conf?path=/etc/nginx/nginx.conf
+Header: X-Token: xxx
 ```
+
+**参数**：
+- `path`：文件绝对路径（可选，默认从 `uploads/` + URL 文件名读取）
 
 **返回**：文件二进制内容（200）或 404
 
@@ -256,8 +273,8 @@ GET /history
 | 看文件信息 | `GET /stat?path=...` | path |
 | 看磁盘 | `GET /disk` | 无 |
 | 执行命令 | `POST /cmd` | cmd, timeout_seconds |
-| 上传文件 | `PUT /upload/:filename` | 文件内容 |
-| 下载文件 | `GET /download/:filename` | 无 |
+| 上传文件 | `PUT /upload/:filename?dir=...` | 文件内容, dir(可选) |
+| 下载文件 | `GET /download/:filename?path=...` | path(可选) |
 | B→C 传文件 | `POST /transfer` | source_url, target_url |
 | 看执行历史 | `GET /history` | 无 |
 

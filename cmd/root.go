@@ -683,9 +683,25 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// 代理模式：转发到目标节点
+	// 读取目标目录参数（可选，默认 uploads/）
+	targetDir := r.URL.Query().Get("dir")
+	if targetDir == "" {
+		targetDir = "uploads"
+	}
+	// 安全检查
+	if filepath.IsAbs(targetDir) {
+		if strings.Contains(targetDir, "..") {
+			http.Error(w, "路径不能包含 ..", http.StatusBadRequest)
+			return
+		}
+	} else {
+		targetDir = "uploads"
+	}
+
+	// 代理模式：转发到目标节点（带上 ?dir= 参数）
 	if target != "" {
-		proxyUpload(w, r, filename)
+		queryDir := r.URL.Query().Get("dir")
+		proxyUpload(w, r, filename, queryDir)
 		return
 	}
 
@@ -698,14 +714,14 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 创建上传目录
-	if err := os.MkdirAll("uploads", 0755); err != nil {
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
 		log.Printf("创建上传目录失败: %v", err)
 		http.Error(w, "创建上传目录失败", http.StatusInternalServerError)
 		return
 	}
 
 	// 保存文件
-	filePath := filepath.Join("uploads", filename)
+	filePath := filepath.Join(targetDir, filename)
 	dst, err := os.Create(filePath)
 	if err != nil {
 		log.Printf("创建文件失败: %v", err)
@@ -793,8 +809,11 @@ func writeWithProgress(dst *os.File, src io.Reader, tracker *uploadProgressTrack
 	}
 }
 
-func proxyUpload(w http.ResponseWriter, r *http.Request, filename string) {
+func proxyUpload(w http.ResponseWriter, r *http.Request, filename string, dir string) {
 	targetURL := target + "/upload/" + filename
+	if dir != "" {
+		targetURL += "?dir=" + dir
+	}
 
 	// 创建流式转发请求，不将整个文件读入内存
 	req, err := http.NewRequest(http.MethodPut, targetURL, r.Body)
