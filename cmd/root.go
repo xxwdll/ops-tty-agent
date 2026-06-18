@@ -832,17 +832,25 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "仅支持 GET 方法", http.StatusMethodNotAllowed)
 		return
 	}
-
-	// 验证token
 	if !validateToken(r) {
 		unauthorized(w)
 		return
 	}
 
-	// 获取文件名
+	// 模式一：通过 ?path= 指定任意绝对路径
+	if customPath := r.URL.Query().Get("path"); customPath != "" {
+		serveFile(w, r, customPath)
+		return
+	}
+
+	// 模式二：从 URL 路径获取文件名，从 uploads/ 读取（兼容旧方式）
 	filename := r.URL.Path
 	if strings.HasPrefix(filename, "/download/") {
 		filename = strings.TrimPrefix(filename, "/download/")
+		if filename == "" {
+			http.Error(w, "缺少文件名", http.StatusBadRequest)
+			return
+		}
 	} else {
 		http.Error(w, "无效的请求路径", http.StatusBadRequest)
 		return
@@ -854,20 +862,31 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 构建文件路径
 	filePath := filepath.Join("uploads", filename)
+	serveFile(w, r, filePath)
+}
 
-	// 检查文件是否存在
-	if _, err := os.Stat(filePath); os.IsNotExist(err) {
-		http.Error(w, "文件不存在", http.StatusNotFound)
+// serveFile 安全地读取并返回文件内容（支持下载代理转发）
+func serveFile(w http.ResponseWriter, r *http.Request, filePath string) {
+	// 安全检查
+	if !filepath.IsAbs(filePath) {
+		filePath = filepath.Clean(filePath)
+	}
+	if strings.Contains(filePath, "..") {
+		http.Error(w, "路径不能包含 ..", http.StatusBadRequest)
 		return
 	}
 
-	// 设置响应头
-	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
-	w.Header().Set("Content-Type", "application/octet-stream")
+	st, err := os.Stat(filePath)
+	if err != nil {
+		http.Error(w, "文件不存在: "+err.Error(), http.StatusNotFound)
+		return
+	}
+	if st.IsDir() {
+		http.Error(w, "不能下载目录", http.StatusBadRequest)
+		return
+	}
 
-	// 发送文件内容
 	src, err := os.Open(filePath)
 	if err != nil {
 		log.Printf("打开文件失败: %v", err)
@@ -876,9 +895,11 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 	defer src.Close()
 
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filepath.Base(filePath)))
+	w.Header().Set("Content-Type", "application/octet-stream")
+
 	if _, err = io.Copy(w, src); err != nil {
 		log.Printf("发送文件失败: %v", err)
-		http.Error(w, "发送文件失败", http.StatusInternalServerError)
 		return
 	}
 
@@ -888,6 +909,10 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 // proxyDownload 转发下载请求到目标节点
 func proxyDownload(w http.ResponseWriter, r *http.Request, filename string) {
 	targetURL := target + "/download/" + filename
+	// 转发 ?path= 参数（如果指定了自定义路径）
+	if customPath := r.URL.Query().Get("path"); customPath != "" {
+		targetURL += "?path=" + customPath
+	}
 
 	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
 	if err != nil {
@@ -895,8 +920,6 @@ func proxyDownload(w http.ResponseWriter, r *http.Request, filename string) {
 		http.Error(w, "创建转发请求失败", http.StatusInternalServerError)
 		return
 	}
-
-	// 转发token
 	req.Header.Set("X-Token", r.Header.Get("X-Token"))
 
 	client := getProxyClient(proxyTimeout)
@@ -914,7 +937,6 @@ func proxyDownload(w http.ResponseWriter, r *http.Request, filename string) {
 		return
 	}
 
-	// 设置响应头并流式传输
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	io.Copy(w, resp.Body)
