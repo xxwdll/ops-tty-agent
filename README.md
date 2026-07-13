@@ -36,13 +36,13 @@ go build -o ops-tty-agent .
 ./build.sh
 ```
 
-## 安装 Claude Code Skill
+## 安装 AI Agent Skill
 
 ```bash
 npx skills add https://github.com/xxwdll/ops-tty-agent --skill ops-tty-agent
 ```
 
-安装后，Claude Code 会自动识别 `ops-tty-agent` 相关命令，AI 可通过此技能直接执行远程命令。
+安装完成后请新建任务或重启客户端。Codex、Claude Code 等兼容客户端会识别 `ops-tty-agent`；也可用 `$ops-tty-agent` 显式调用。
 
 ## 使用方法
 
@@ -284,13 +284,13 @@ go build -o ops-tty-agent .
 ./build.sh
 ```
 
-## Install Claude Code Skill
+## Install the AI Agent Skill
 
 ```bash
 npx skills add https://github.com/xxwdll/ops-tty-agent --skill ops-tty-agent
 ```
 
-After installation, Claude Code will automatically recognize `ops-tty-agent` related commands.
+After installation, start a new task or restart the client. Compatible clients such as Codex and Claude Code will discover `ops-tty-agent`; use `$ops-tty-agent` to invoke it explicitly.
 
 ## Usage
 
