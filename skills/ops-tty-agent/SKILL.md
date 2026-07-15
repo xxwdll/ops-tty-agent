@@ -13,6 +13,15 @@ description: 远程命令执行和文件操作代理。当用户需要查看远�
 
 ## 一、决策流程：先判断场景，再选接口
 
+### 场景 0：通过跳板节点 B 操作下游节点 C
+B 启动为本地模式，客户端在请求中携带目标信息即可动态路由：
+
+- **POST /cmd**：body 中加 `target` 和 `target_token` 字段
+- **GET /tail、/stat、/disk、/download**：Header 加 `X-Target` 和 `X-Target-Token`
+- **PUT /upload**：Header 加 `X-Target` 和 `X-Target-Token`
+
+**核心原则**：B 是无状态路由器，一个 B 可同时代理 C1、C2、C3...多个下游节点，每个节点可有独立 token。
+
 ### 场景 1：查看日志文件
 **不要** `bash -c "tail -n 100 /var/log/xxx"` ❌
 **要** `GET /tail?path=/var/log/xxx&lines=100` ✅
@@ -48,6 +57,12 @@ A（本机）做中转，不落盘，流式传输。
 
 所有请求 Header 必须携带：`X-Token: <token>`
 
+**动态代理**（通过 B 节点跳转到 C 节点）：
+- `POST /cmd`：在 JSON body 中加 `target` / `target_token` 字段
+- `PUT /upload`：在 Header 中加 `X-Target` / `X-Target-Token`
+- GET 请求：在 Header 中加 `X-Target: <url>` / `X-Target-Token: <token>`（可选）
+- B 节点无需 `--target` 参数，纯本地模式即可同时代理多个下游节点
+
 ### POST /cmd — 执行命令
 
 **什么时候用**：专用接口覆盖不了的复杂操作（grep、awk、管道、安装软件等）
@@ -56,11 +71,15 @@ A（本机）做中转，不落盘，流式传输。
 ```json
 {
   "cmd": "df -h",
-  "timeout_seconds": 60
+  "timeout_seconds": 60,
+  "target": "http://C1:8081",
+  "target_token": "c1-token"
 }
 ```
 - `cmd`：要执行的命令字符串（必填）
 - `timeout_seconds`：超时秒数（可选，默认 60s）。长命令如 `yum install` 可设 300
+- `target`：动态指定下一跳节点 URL（可选）。B 收到后会转发到该节点
+- `target_token`：下一跳节点的认证 token（可选，不填则用当前 B 节点的 token）
 
 **返回**：
 ```json
@@ -271,11 +290,13 @@ GET /history
 | 看日志 | `GET /tail?path=...&lines=...` | path, lines, max_bytes |
 | 看文件信息 | `GET /stat?path=...` | path |
 | 看磁盘 | `GET /disk` | 无 |
-| 执行命令 | `POST /cmd` | cmd, timeout_seconds |
+| 执行命令 | `POST /cmd` | cmd, timeout_seconds, target(可选), target_token(可选) |
 | 上传文件 | `PUT /upload/:filename?dir=...` | 文件内容, dir(可选) |
 | 下载文件 | `GET /download/:filename?path=...` | path(可选) |
 | B→C 传文件 | `POST /transfer` | source_url, target_url |
 | 看执行历史 | `GET /history` | 无 |
+| 动态跳转(GET) | 任意 GET 端点 + Header `X-Target` / `X-Target-Token` | 目标 URL 和 token |
+| 动态跳转(POST) | POST /cmd body 中加 `target` / `target_token` | 目标 URL 和 token |
 
 ---
 
@@ -307,12 +328,48 @@ GET /history
 
 ### 代理模式（A→B 跳转）
 
+**静态代理（启动时指定固定目标）**：
 ```bash
 # A节点（代理模式）
 ./ops-tty-agent --port 80 --target http://b-node:8080 --token mytoken
 
 # B节点（本地模式）
 ./ops-tty-agent --port 8080 --shell bash --token mytoken
+```
+
+**动态代理（B 做跳板，1 对多）**：
+```bash
+# B 节点（跳板，本地模式，无需 --target）
+./ops-tty-agent --port 8080 --shell bash --auto-confirm yes --token b-token
+
+# C1——db 服务器
+./ops-tty-agent --port 8081 --shell bash --token c1-token
+
+# C2——web 服务器
+./ops-tty-agent --port 8082 --shell bash --token c2-token
+```
+
+通过 B 跳转到 C1 执行命令：
+```bash
+curl -X POST http://B:8080/cmd \
+  -H "X-Token: b-token" \
+  -d '{"cmd":"df -h","target":"http://C1:8081","target_token":"c1-token"}'
+```
+
+通过 B 查看 C2 磁盘（GET 端点用 Header）：
+```bash
+curl http://B:8080/disk \
+  -H "X-Token: b-token" \
+  -H "X-Target: http://C2:8082" \
+  -H "X-Target-Token: c2-token"
+```
+
+通过 B 查看 C1 的日志：
+```bash
+curl "http://B:8080/tail?path=/var/log/syslog&lines=50" \
+  -H "X-Token: b-token" \
+  -H "X-Target: http://C1:8081" \
+  -H "X-Target-Token: c1-token"
 ```
 
 ### 跨节点传输（B→C，A 做中转）

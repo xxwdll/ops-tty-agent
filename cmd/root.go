@@ -10,6 +10,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -66,32 +67,34 @@ func Execute() {
 type CommandRequest struct {
 	Cmd            string `json:"cmd"`
 	TimeoutSeconds int    `json:"timeout_seconds,omitempty"` // 0 = 默认 60s
+	Target         string `json:"target,omitempty"`          // 动态指定下一跳 URL（如 http://C:8081）
+	TargetToken    string `json:"target_token,omitempty"`    // 下一跳的认证 token（不填则用当前节点 token）
 }
 
 // CommandResponse 是命令执行的结构化返回，把信息给足，让 LLM 自己判断。
 type CommandResponse struct {
-	Stdout     string `json:"stdout,omitempty"`      // 标准输出
-	Stderr     string `json:"stderr,omitempty"`      // 标准错误
-	ExitCode   int    `json:"exit_code"`             // 进程退出码（0=成功）
-	Error      string `json:"error,omitempty"`       // 执行层面的错误（如超时、shell 不存在）
-	DurationMs int64  `json:"duration_ms"`           // 执行耗时（毫秒）
-	Truncated  bool   `json:"truncated,omitempty"`   // stdout 是否因超限被截断
+	Stdout     string `json:"stdout,omitempty"`    // 标准输出
+	Stderr     string `json:"stderr,omitempty"`    // 标准错误
+	ExitCode   int    `json:"exit_code"`           // 进程退出码（0=成功）
+	Error      string `json:"error,omitempty"`     // 执行层面的错误（如超时、shell 不存在）
+	DurationMs int64  `json:"duration_ms"`         // 执行耗时（毫秒）
+	Truncated  bool   `json:"truncated,omitempty"` // stdout 是否因超限被截断
 }
 
 // TransferRequest 是跨节点文件传输请求
 type TransferRequest struct {
-	SourceURL   string `json:"source_url"`            // 源文件下载地址，如 http://B:8080/download/file.txt
+	SourceURL   string `json:"source_url"`             // 源文件下载地址，如 http://B:8080/download/file.txt
 	SourceToken string `json:"source_token,omitempty"` // 源节点 Token（不填则用当前服务 Token）
-	TargetURL   string `json:"target_url"`            // 目标上传地址，如 http://C:8080/upload/file.txt
+	TargetURL   string `json:"target_url"`             // 目标上传地址，如 http://C:8080/upload/file.txt
 	TargetToken string `json:"target_token,omitempty"` // 目标节点 Token（不填则用当前服务 Token）
 }
 
 // TransferResponse 是跨节点文件传输响应
 type TransferResponse struct {
-	Success   bool   `json:"success"`
-	Bytes     int64  `json:"bytes,omitempty"`
-	DurationMs int64 `json:"duration_ms,omitempty"`
-	Error     string `json:"error,omitempty"`
+	Success    bool   `json:"success"`
+	Bytes      int64  `json:"bytes,omitempty"`
+	DurationMs int64  `json:"duration_ms,omitempty"`
+	Error      string `json:"error,omitempty"`
 }
 
 // TailResponse 是 /tail 接口的结构化返回
@@ -106,7 +109,7 @@ type TailResponse struct {
 // StatResponse 是 /stat 接口的结构化返回
 type StatResponse struct {
 	Path      string    `json:"path"`
-	Type      string    `json:"type"`       // "file" | "dir" | "symlink"
+	Type      string    `json:"type"` // "file" | "dir" | "symlink"
 	SizeBytes int64     `json:"size_bytes"`
 	SizeHuman string    `json:"size_human"`
 	Mtime     time.Time `json:"mtime"`
@@ -118,14 +121,14 @@ type StatResponse struct {
 
 // DiskEntry 是单个挂载点的磁盘信息
 type DiskEntry struct {
-	Filesystem string `json:"filesystem"`
-	Mountpoint string `json:"mountpoint"`
-	SizeBytes  int64  `json:"size_bytes"`
-	SizeHuman  string `json:"size_human"`
-	UsedBytes  int64  `json:"used_bytes"`
-	UsedHuman  string `json:"used_human"`
-	FreeBytes  int64  `json:"free_bytes"`
-	FreeHuman  string `json:"free_human"`
+	Filesystem  string `json:"filesystem"`
+	Mountpoint  string `json:"mountpoint"`
+	SizeBytes   int64  `json:"size_bytes"`
+	SizeHuman   string `json:"size_human"`
+	UsedBytes   int64  `json:"used_bytes"`
+	UsedHuman   string `json:"used_human"`
+	FreeBytes   int64  `json:"free_bytes"`
+	FreeHuman   string `json:"free_human"`
 	UsedPercent string `json:"used_percent"`
 }
 
@@ -260,12 +263,13 @@ func startServer() {
 	if target != "" {
 		// 代理模式：纯转发，忽略 shell 和 auto-confirm 参数
 		log.Printf("代理服务已启动 (代理模式)")
-		log.Printf("监听端口: %d, 目标节点: %s", port, target)
-		log.Printf("说明: 代理模式下仅转发请求，不执行本地命令")
+		log.Printf("监听端口: %d, 默认目标节点: %s", port, target)
+		log.Printf("说明: 请求中可通过 target 字段/Header 覆盖默认目标")
 	} else {
-		// 本地模式：执行本地命令
-		log.Printf("代理服务已启动 (本地模式)")
+		// 本地模式：执行本地命令，也支持请求级动态代理
+		log.Printf("代理服务已启动 (本地模式，支持动态代理)")
 		log.Printf("监听端口: %d, shell: %s, auto-confirm: %s", port, shell, autoConfirm)
+		log.Printf("说明: 请求中可携带 target 字段/Header 动态转发到其他节点")
 	}
 	log.Printf("访问 http://<主机地址>%s/cmd 执行命令", addr)
 	log.Printf("访问 http://<主机地址>%s/tail?path=... 读取文件尾部", addr)
@@ -373,6 +377,32 @@ func unauthorized(w http.ResponseWriter) {
 	})
 }
 
+// getTargetFromHeader 从 HTTP Header 提取动态代理目标和 token
+func getTargetFromHeader(r *http.Request) (string, string) {
+	return r.Header.Get("X-Target"), r.Header.Get("X-Target-Token")
+}
+
+// resolveTarget 解析最终转发目标：请求级 target > 启动参数 --target > 空（本地执行）
+// token 未指定时默认使用 serverToken
+func resolveTarget(reqTarget, reqToken string) (string, string) {
+	if reqTarget != "" {
+		token := reqToken
+		if token == "" {
+			token = serverToken
+		}
+		// 自动补全协议（兼容 "10.0.1.1:8080" 这种写法）
+		if !strings.HasPrefix(reqTarget, "http://") && !strings.HasPrefix(reqTarget, "https://") {
+			reqTarget = "http://" + reqTarget
+		}
+		return reqTarget, token
+	}
+	// 回退到启动参数 --target
+	if target != "" {
+		return target, serverToken
+	}
+	return "", ""
+}
+
 func handleCommand(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "仅支持 POST 方法", http.StatusMethodNotAllowed)
@@ -407,9 +437,10 @@ func handleCommand(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 代理模式：转发到目标节点
-	if target != "" {
-		proxyCommand(w, r, req)
+	// 动态代理：请求级 target > 启动参数 --target > 本地执行
+	effectiveTarget, effectiveToken := resolveTarget(req.Target, req.TargetToken)
+	if effectiveTarget != "" {
+		proxyCommand(w, r, req, effectiveTarget, effectiveToken)
 		return
 	}
 
@@ -533,26 +564,31 @@ func handleHistoryDetail(w http.ResponseWriter, r *http.Request) {
 }
 
 // proxyCommand 转发命令到目标节点
-func proxyCommand(w http.ResponseWriter, r *http.Request, req CommandRequest) {
-	targetURL := target + "/cmd"
-	jsonData, _ := json.Marshal(req)
+func proxyCommand(w http.ResponseWriter, r *http.Request, req CommandRequest, targetURL, targetToken string) {
+	fullURL := strings.TrimRight(targetURL, "/") + "/cmd"
+	// target/target_token 只用于当前这一跳。若继续传给下游，下游会把
+	// 自己再次解析成目标节点并形成代理自循环。
+	forwardReq := req
+	forwardReq.Target = ""
+	forwardReq.TargetToken = ""
+	jsonData, _ := json.Marshal(forwardReq)
 
-	httpReq, err := http.NewRequest(http.MethodPost, targetURL, strings.NewReader(string(jsonData)))
+	httpReq, err := http.NewRequest(http.MethodPost, fullURL, strings.NewReader(string(jsonData)))
 	if err != nil {
 		log.Printf("创建转发请求失败: %v", err)
 		jsonEncode(w, CommandResponse{ExitCode: -1, Error: "创建转发请求失败: " + err.Error()})
 		return
 	}
 
-	// 转发token
+	// 使用目标节点的 token
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("X-Token", r.Header.Get("X-Token"))
+	httpReq.Header.Set("X-Token", targetToken)
 
 	startTime := time.Now()
 	client := getProxyClient(proxyTimeout)
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		log.Printf("代理转发失败: %v", err)
+		log.Printf("代理转发失败 [%s]: %v", targetURL, err)
 		jsonEncode(w, CommandResponse{ExitCode: -1, Error: "代理转发失败: " + err.Error()})
 		return
 	}
@@ -565,7 +601,7 @@ func proxyCommand(w http.ResponseWriter, r *http.Request, req CommandRequest) {
 		return
 	}
 
-	log.Printf("代理转发成功: %s -> %s", req.Cmd, target)
+	log.Printf("动态代理转发成功: %s -> %s", req.Cmd, targetURL)
 
 	// 记录执行历史（兼容旧格式：将 stdout+stderr 合并到 Output）
 	record := &ExecutionRecord{
@@ -693,9 +729,11 @@ func handleUpload(w http.ResponseWriter, r *http.Request) {
 	// 读取目标目录参数
 	rawDir := r.URL.Query().Get("dir")
 
-	// 代理模式：转发到目标节点（带上 ?dir= 参数）
-	if target != "" {
-		proxyUpload(w, r, filename, rawDir)
+	// 动态代理：请求级 X-Target > 启动参数 --target > 本地执行
+	headerTarget, headerToken := getTargetFromHeader(r)
+	effectiveTarget, effectiveToken := resolveTarget(headerTarget, headerToken)
+	if effectiveTarget != "" {
+		proxyUpload(w, r, filename, rawDir, effectiveTarget, effectiveToken)
 		return
 	}
 
@@ -816,14 +854,14 @@ func writeWithProgress(dst *os.File, src io.Reader, tracker *uploadProgressTrack
 	}
 }
 
-func proxyUpload(w http.ResponseWriter, r *http.Request, filename string, dir string) {
-	targetURL := target + "/upload/" + filename
+func proxyUpload(w http.ResponseWriter, r *http.Request, filename string, dir string, targetURL, targetToken string) {
+	uploadURL := strings.TrimRight(targetURL, "/") + "/upload/" + url.PathEscape(filename)
 	if dir != "" {
-		targetURL += "?dir=" + dir
+		uploadURL += "?dir=" + url.QueryEscape(dir)
 	}
 
 	// 创建流式转发请求，不将整个文件读入内存
-	req, err := http.NewRequest(http.MethodPut, targetURL, r.Body)
+	req, err := http.NewRequest(http.MethodPut, uploadURL, r.Body)
 	if err != nil {
 		log.Printf("创建转发请求失败: %v", err)
 		http.Error(w, "创建转发请求失败", http.StatusInternalServerError)
@@ -834,13 +872,13 @@ func proxyUpload(w http.ResponseWriter, r *http.Request, filename string, dir st
 	if disp := r.Header.Get("Content-Disposition"); disp != "" {
 		req.Header.Set("Content-Disposition", disp)
 	}
-	// 转发token
-	req.Header.Set("X-Token", r.Header.Get("X-Token"))
+	// 使用目标节点的 token
+	req.Header.Set("X-Token", targetToken)
 
 	client := getProxyClient(proxyTimeout)
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("代理上传失败: %v", err)
+		log.Printf("代理上传失败 [%s]: %v", targetURL, err)
 		http.Error(w, "代理上传失败: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -850,7 +888,7 @@ func proxyUpload(w http.ResponseWriter, r *http.Request, filename string, dir st
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
-	log.Printf("代理上传成功: %s -> %s", filename, target)
+	log.Printf("代理上传成功: %s -> %s", filename, targetURL)
 }
 
 func handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -863,6 +901,22 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 提取文件名（用于代理下载时的文件名提示）
+	filename := r.URL.Path
+	if strings.HasPrefix(filename, "/download/") {
+		filename = strings.TrimPrefix(filename, "/download/")
+	} else {
+		filename = "file"
+	}
+
+	// 动态代理：请求级 X-Target > 启动参数 --target > 本地执行
+	headerTarget, headerToken := getTargetFromHeader(r)
+	effectiveTarget, effectiveToken := resolveTarget(headerTarget, headerToken)
+	if effectiveTarget != "" {
+		proxyDownload(w, r, filename, effectiveTarget, effectiveToken)
+		return
+	}
+
 	// 模式一：通过 ?path= 指定任意绝对路径
 	if customPath := r.URL.Query().Get("path"); customPath != "" {
 		serveFile(w, r, customPath)
@@ -870,21 +924,8 @@ func handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 模式二：从 URL 路径获取文件名，从 uploads/ 读取（兼容旧方式）
-	filename := r.URL.Path
-	if strings.HasPrefix(filename, "/download/") {
-		filename = strings.TrimPrefix(filename, "/download/")
-		if filename == "" {
-			http.Error(w, "缺少文件名", http.StatusBadRequest)
-			return
-		}
-	} else {
-		http.Error(w, "无效的请求路径", http.StatusBadRequest)
-		return
-	}
-
-	// 代理模式：转发到目标节点
-	if target != "" {
-		proxyDownload(w, r, filename)
+	if filename == "" {
+		http.Error(w, "缺少文件名", http.StatusBadRequest)
 		return
 	}
 
@@ -933,25 +974,25 @@ func serveFile(w http.ResponseWriter, r *http.Request, filePath string) {
 }
 
 // proxyDownload 转发下载请求到目标节点
-func proxyDownload(w http.ResponseWriter, r *http.Request, filename string) {
-	targetURL := target + "/download/" + filename
+func proxyDownload(w http.ResponseWriter, r *http.Request, filename string, targetURL, targetToken string) {
+	downloadURL := strings.TrimRight(targetURL, "/") + "/download/" + url.PathEscape(filename)
 	// 转发 ?path= 参数（如果指定了自定义路径）
 	if customPath := r.URL.Query().Get("path"); customPath != "" {
-		targetURL += "?path=" + customPath
+		downloadURL += "?path=" + url.QueryEscape(customPath)
 	}
 
-	req, err := http.NewRequest(http.MethodGet, targetURL, nil)
+	req, err := http.NewRequest(http.MethodGet, downloadURL, nil)
 	if err != nil {
 		log.Printf("创建转发请求失败: %v", err)
 		http.Error(w, "创建转发请求失败", http.StatusInternalServerError)
 		return
 	}
-	req.Header.Set("X-Token", r.Header.Get("X-Token"))
+	req.Header.Set("X-Token", targetToken)
 
 	client := getProxyClient(proxyTimeout)
 	resp, err := client.Do(req)
 	if err != nil {
-		log.Printf("代理下载失败: %v", err)
+		log.Printf("代理下载失败 [%s]: %v", targetURL, err)
 		http.Error(w, "代理下载失败: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
@@ -966,7 +1007,7 @@ func proxyDownload(w http.ResponseWriter, r *http.Request, filename string) {
 	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s", filename))
 	w.Header().Set("Content-Type", "application/octet-stream")
 	io.Copy(w, resp.Body)
-	log.Printf("代理下载成功: %s -> %s", filename, target)
+	log.Printf("代理下载成功: %s -> %s", filename, targetURL)
 }
 
 // handleTransfer 跨节点文件传输：A（本机）作为中转，从 source 下载并上传到 target
@@ -1175,6 +1216,13 @@ func handleTail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 动态代理：请求级 X-Target > 启动参数 --target > 本地执行
+	headerTarget, headerToken := getTargetFromHeader(r)
+	if effectiveTarget, effectiveToken := resolveTarget(headerTarget, headerToken); effectiveTarget != "" {
+		proxyTail(w, r, effectiveTarget, effectiveToken)
+		return
+	}
+
 	path := r.URL.Query().Get("path")
 	if path == "" {
 		jsonEncode(w, TailResponse{Error: "缺少 path 参数"})
@@ -1264,6 +1312,13 @@ func handleStat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 动态代理：请求级 X-Target > 启动参数 --target > 本地执行
+	headerTarget, headerToken := getTargetFromHeader(r)
+	if effectiveTarget, effectiveToken := resolveTarget(headerTarget, headerToken); effectiveTarget != "" {
+		proxyStat(w, r, effectiveTarget, effectiveToken)
+		return
+	}
+
 	path := r.URL.Query().Get("path")
 	if path == "" {
 		jsonEncode(w, StatResponse{Error: "缺少 path 参数"})
@@ -1316,6 +1371,13 @@ func handleDisk(w http.ResponseWriter, r *http.Request) {
 	}
 	if !validateToken(r) {
 		unauthorized(w)
+		return
+	}
+
+	// 动态代理：请求级 X-Target > 启动参数 --target > 本地执行
+	headerTarget, headerToken := getTargetFromHeader(r)
+	if effectiveTarget, effectiveToken := resolveTarget(headerTarget, headerToken); effectiveTarget != "" {
+		proxyDisk(w, r, effectiveTarget, effectiveToken)
 		return
 	}
 
@@ -1374,6 +1436,79 @@ func handleDisk(w http.ResponseWriter, r *http.Request) {
 	}
 
 	jsonEncode(w, DiskResponse{Filesystems: entries})
+}
+
+// proxyDisk 转发磁盘查询到目标节点
+func proxyDisk(w http.ResponseWriter, r *http.Request, targetURL, targetToken string) {
+	req, err := http.NewRequest(http.MethodGet, strings.TrimRight(targetURL, "/")+"/disk", nil)
+	if err != nil {
+		jsonEncode(w, DiskResponse{Error: "创建转发请求失败: " + err.Error()})
+		return
+	}
+	req.Header.Set("X-Token", targetToken)
+
+	client := getProxyClient(proxyTimeout)
+	resp, err := client.Do(req)
+	if err != nil {
+		jsonEncode(w, DiskResponse{Error: "代理转发失败: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	copyProxyResponse(w, resp)
+}
+
+// proxyStat 转发文件查询到目标节点
+func proxyStat(w http.ResponseWriter, r *http.Request, targetURL, targetToken string) {
+	fullURL := strings.TrimRight(targetURL, "/") + "/stat" + "?" + r.URL.RawQuery
+	req, err := http.NewRequest(http.MethodGet, fullURL, nil)
+	if err != nil {
+		jsonEncode(w, StatResponse{Error: "创建转发请求失败: " + err.Error()})
+		return
+	}
+	req.Header.Set("X-Token", targetToken)
+
+	client := getProxyClient(proxyTimeout)
+	resp, err := client.Do(req)
+	if err != nil {
+		jsonEncode(w, StatResponse{Error: "代理转发失败: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	copyProxyResponse(w, resp)
+}
+
+// proxyTail 转发日志读取到目标节点
+func proxyTail(w http.ResponseWriter, r *http.Request, targetURL, targetToken string) {
+	fullURL := strings.TrimRight(targetURL, "/") + "/tail" + "?" + r.URL.RawQuery
+	req, err := http.NewRequest(http.MethodGet, fullURL, nil)
+	if err != nil {
+		jsonEncode(w, TailResponse{Error: "创建转发请求失败: " + err.Error()})
+		return
+	}
+	req.Header.Set("X-Token", targetToken)
+
+	client := getProxyClient(proxyTimeout)
+	resp, err := client.Do(req)
+	if err != nil {
+		jsonEncode(w, TailResponse{Error: "代理转发失败: " + err.Error()})
+		return
+	}
+	defer resp.Body.Close()
+
+	copyProxyResponse(w, resp)
+}
+
+// copyProxyResponse 将下游响应原样返回，避免把 401/404/500 等错误伪装成 200。
+func copyProxyResponse(w http.ResponseWriter, resp *http.Response) {
+	if contentType := resp.Header.Get("Content-Type"); contentType != "" {
+		w.Header().Set("Content-Type", contentType)
+	}
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		log.Printf("复制代理响应失败: %v", err)
+	}
 }
 
 // humanizeBytes 将字节数转为人类可读格式

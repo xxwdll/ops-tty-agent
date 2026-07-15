@@ -30,4 +30,5 @@ Thumbs.db
 # Go
 *.test
 *.out
+.claude/
 vendor/
