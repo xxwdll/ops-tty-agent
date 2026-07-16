@@ -36,6 +36,75 @@ go build -o ops-tty-agent .
 ./build.sh
 ```
 
+## 部署指南（systemd）
+
+推荐使用 systemd 管理服务，支持开机自启和异常自动重启。
+
+### 1. 编译或下载二进制
+
+```bash
+# 本机编译
+./build.sh
+
+# 或从已有服务器复制（架构 x86_64 用 linux-amd64）
+```
+
+### 2. 创建目录并部署
+
+```bash
+mkdir -p /opt/ops-tty-agent
+cp ops-tty-agent-linux-amd64 /opt/ops-tty-agent/
+chmod +x /opt/ops-tty-agent/ops-tty-agent-linux-amd64
+```
+
+### 3. 创建 systemd Service
+
+```bash
+cat > /etc/systemd/system/ops-tty-agent.service << 'EOF'
+[Unit]
+Description=ops-tty-agent
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ops-tty-agent
+ExecStart=/opt/ops-tty-agent/ops-tty-agent-linux-amd64 -k <your-token> -a yes -p 80
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+### 4. 启动与管理
+
+```bash
+systemctl daemon-reload           # 加载新 service
+systemctl enable ops-tty-agent    # 开机自启
+systemctl start ops-tty-agent     # 启动服务
+systemctl status ops-tty-agent    # 查看状态
+systemctl restart ops-tty-agent   # 重启服务
+```
+
+### 5. 更新二进制
+
+```bash
+# 先上传新版到临时文件，再原子替换 + 重启
+systemctl stop ops-tty-agent
+cp ops-tty-agent-linux-amd64 /opt/ops-tty-agent/
+systemctl start ops-tty-agent
+```
+
+### 配置说明
+
+| 配置 | 说明 |
+|------|------|
+| `WorkingDirectory` | 服务根目录，历史文件和上传文件默认落于此 |
+| `Restart=always` | 进程异常退出 5 秒后自动重启 |
+| `WantedBy=multi-user.target` | 开机自启 |
+| `-a yes` | 自动确认命令，适合 AI 自动化场景 |
+
 ## 安装 AI Agent Skill
 
 ```bash
@@ -239,7 +308,7 @@ curl -X POST http://localhost:80/transfer \
 
 - 本工具可以执行任意命令，请注意安全使用
 - 建议在受控环境中使用，并设置强Token
-- 上传的文件会保存在当前目录的 `uploads` 文件夹中
+- 上传的文件默认保存在当前工作目录，可通过 `?dir=` 指定目标路径
 - 代理模式下 `--shell` 和 `--auto-confirm` 参数无效
 
 ### 危险命令检查（可选）
@@ -370,7 +439,7 @@ Requests sent to Node A are automatically forwarded to Node B. All nodes in the 
 
 - This tool can execute arbitrary commands - use with caution
 - Recommended to use in controlled environments with strong tokens
-- Uploaded files are saved in the `uploads` directory
+- Uploaded files are saved in the current working directory by default; use `?dir=` for custom paths
 - In proxy mode, `--shell` and `--auto-confirm` are ignored
 
 ### Dangerous Command Check (Optional)
